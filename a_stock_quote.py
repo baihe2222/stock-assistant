@@ -801,6 +801,53 @@ def print_quote_line(quote: Dict[str, object]) -> None:
     print(line)
 
 
+def print_quote_kv(quote: Dict[str, object]) -> None:
+    """Print quote in key-value Chinese label style.
+
+    Example:
+      名称: 浦发银行
+      代码: 600000
+      现价: 10.92
+      涨跌幅: 0.64%
+      成交量: 1234手
+      成交额: 12.34亿
+      委比: 10.11%
+      买卖比: 1.23
+      时间: 2024-09-13 15:00:03
+    """
+    current_price = float(quote.get("current") or 0.0)
+    prev_close = float(quote.get("prev_close") or 0.0)
+    change_pct = (current_price - prev_close) / prev_close * 100.0 if prev_close > 0 else 0.0
+    order_ratio, buy_sell_ratio = compute_order_metrics(quote)
+
+    exchange = str(quote.get("exchange") or "")
+    code_digits = str(quote.get("code") or "")
+    name_display = str(quote.get("name") or "-")
+    volume_shares = int(quote.get("volume_shares") or 0)
+    amount_yuan = float(quote.get("amount_yuan") or 0.0)
+    tdate = str(quote.get("date") or "").strip()
+    ttime = str(quote.get("time") or "").strip()
+
+    print(f"名称: {name_display}")
+    print(f"代码: {code_digits}")
+    print(f"现价: {format_number(current_price, 2)}")
+    print(f"涨跌幅: {format_number(change_pct, 2)}%")
+
+    if exchange == "hk":
+        print(f"成交量: {volume_shares}股")
+        print(f"成交额: {format_number(amount_yuan / 1e8, 2)}亿")
+    else:
+        print(f"成交量: {volume_shares // 100}手")
+        print(f"成交额: {format_number(amount_yuan / 1e8, 2)}亿")
+        print(f"委比: {format_number(order_ratio, 2)}%")
+        print(f"买卖比: {('∞' if buy_sell_ratio == float('inf') else format_number(buy_sell_ratio, 2))}")
+
+    ts = f"{tdate} {ttime}".strip()
+    if ts:
+        print(f"时间: {ts}")
+    print("")
+
+
 def print_order_book(quote: Dict[str, object]) -> None:
     # HK sources do not provide five-level order book in this endpoint
     if str(quote.get("exchange")) == "hk":
@@ -837,26 +884,15 @@ def query_and_display(codes_or_names: List[str], show_detail: bool = False) -> N
         print(f"请求行情失败：{exc}")
         return
 
-    # Build table rows
-    headers = [
-        "代码",
-        "名称",
-        "现价",
-        "涨跌幅",
-        "换手率",
-        "距MA12",
-        "KDJ_J",
-        "MACD",
-        "时间",
-    ]
-    rows: List[List[str]] = []
-
     details: List[Tuple[str, Dict[str, object]]] = []
 
     for full_code in normalized:
         quote = quotes.get(full_code)
         if not quote:
-            rows.append([full_code, "-", "-", "-", "-", "-", "-", "-", "-"])
+            # Minimal placeholder output when no quote is returned
+            print(f"名称: -")
+            print(f"代码: {full_code}")
+            print("")
             continue
 
         exchange = str(quote.get("exchange") or "")
@@ -901,21 +937,10 @@ def query_and_display(codes_or_names: List[str], show_detail: bool = False) -> N
             # HK not computed for now
             pass
 
-        rows.append([
-            f"{exchange}{code_digits}",
-            name_display,
-            format_number(current_price, 2),
-            _format_percent(change_pct),
-            turnover_pct_str,
-            ma12_pos_str,
-            kdj_j_str,
-            macd_status_str,
-            f"{tdate} {ttime}".strip(),
-        ])
+        # Print in key-value style
+        print_quote_kv(quote)
 
         details.append((full, quote))
-
-    _print_table(headers, rows)
 
     if show_detail:
         for _, quote in details:
