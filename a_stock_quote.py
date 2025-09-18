@@ -545,15 +545,19 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     codes: List[str] = args.codes
     if not codes:
-        # Interactive fallback
-        try:
-            code_input = input("请输入A股代码(如 600519 或 多个用空格分隔): ").strip()
-        except EOFError:
-            code_input = ""
-        if not code_input:
-            print("未输入代码。")
-            return 1
-        codes = code_input.split()
+        # Interactive prompt loop: only 'q' exits
+        while True:
+            try:
+                code_input = input("请输入A股代码(如 600519 或 多个用空格分隔，输入 q 退出): ").strip()
+            except EOFError:
+                # EOF or non-interactive stdin; exit gracefully
+                return 0
+            if code_input.lower() == "q":
+                return 0
+            if not code_input:
+                continue
+            codes = code_input.split()
+            query_and_display(codes, show_detail=args.detail)
 
     if args.loop:
         try:
