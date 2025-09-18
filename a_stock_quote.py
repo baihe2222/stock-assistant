@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-A股股票实时行情查询（基于新浪行情接口）
+A股/港股股票实时行情查询（基于新浪行情接口）
 
 功能：
 - 输入一个或多个A股代码（如 600519、000001），实时查询：当前价、涨跌幅、涨跌额、成交量/额、委比、买卖比等
@@ -117,16 +117,20 @@ def parse_suggest_value(text: str) -> List[Dict[str, str]]:
 
 
 def suggest_full_codes_for_key(keyword: str, timeout: float = 5.0) -> List[str]:
-    """Query Sina suggest API and return candidate full codes like sh600000.
+    """Query Sina suggest API and return candidate full codes like sh600000 / hk00700.
 
-    Filters to exchange-prefixed codes that our quote endpoint can handle: sh/sz/bj.
+    Filters to exchange-prefixed codes that our quote endpoint can handle: sh/sz/bj/hk.
     """
     key = keyword.strip()
     if not key:
         return []
     urls = [
-        f"{SINA_SUGGEST_ENDPOINT}/type=11&key={urllib.parse.quote(key)}",  # A股优先（正确路径样式）
-        f"{SINA_SUGGEST_ENDPOINT}/key={urllib.parse.quote(key)}",           # 兜底（正确路径样式）
+        # A股优先
+        f"{SINA_SUGGEST_ENDPOINT}/type=11&key={urllib.parse.quote(key)}",
+        # 港股候选
+        f"{SINA_SUGGEST_ENDPOINT}/type=31&key={urllib.parse.quote(key)}",
+        # 兜底（不指定 type）
+        f"{SINA_SUGGEST_ENDPOINT}/key={urllib.parse.quote(key)}",
     ]
 
     result: List[str] = []
@@ -139,13 +143,28 @@ def suggest_full_codes_for_key(keyword: str, timeout: float = 5.0) -> List[str]:
             continue
         entries = parse_suggest_value(text)
         for e in entries:
-            full = (e.get("full") or "").lower()
-            if not full:
-                continue
-            if not (full.startswith("sh") or full.startswith("sz") or full.startswith("bj")):
-                # skip non-A share codes like of (fund) or futures codes
-                continue
-            if full not in seen:
+            typ = (e.get("type") or e.get("typ") or "").strip()
+            full_raw = (e.get("full") or "").strip()
+            code_raw = (e.get("code") or "").strip()
+            # A股：full 已带前缀（sh/sz/bj）
+            full_lower = full_raw.lower()
+            if full_lower.startswith(("sh", "sz", "bj")):
+                full = full_lower
+            else:
+                # 港股 suggest 返回 5 位数字代码或场内品种代码，转换为 hk 前缀
+                # 优先使用 full 字段，否则回落到 code 字段
+                val = full_raw or code_raw
+                if not val:
+                    continue
+                # 纯数字 => 左侧补零到 5 位
+                if val.isdigit():
+                    val = val.zfill(5)
+                else:
+                    # 指数/品种代码 => 大写
+                    val = val.upper()
+                full = f"hk{val}"
+
+            if full not in seen and full.startswith(("sh", "sz", "bj", "hk")):
                 seen.add(full)
                 result.append(full)
 
@@ -192,6 +211,19 @@ def build_index_alias_map() -> Dict[str, str]:
         "中证500": "sh000905",
         # CSI 1000
         "中证1000": "sh000852",
+
+        # Hong Kong indices (Hang Seng family)
+        "恒生指数": "hkHSI",
+        "恒指": "hkHSI",
+        "HSI": "hkHSI",
+        "恒生科技指数": "hkHSTECH",
+        "恒生科技": "hkHSTECH",
+        "HSTECH": "hkHSTECH",
+        "恒生中国企业指数": "hkHSCEI",
+        "国企指数": "hkHSCEI",
+        "HSCEI": "hkHSCEI",
+        "恒生香港中资企业指数": "hkHSCCI",
+        "HSCCI": "hkHSCCI",
     }
     # Also allow ascii fallbacks (no change needed for Chinese case)
     return aliases
@@ -253,8 +285,8 @@ def infer_exchange_prefix(stock_code: str) -> Optional[str]:
     if not code:
         return None
 
-    # Already prefixed
-    if code.startswith("sh") or code.startswith("sz") or code.startswith("bj"):
+    # Already prefixed (including hk)
+    if code.startswith("sh") or code.startswith("sz") or code.startswith("bj") or code.startswith("hk"):
         return code[:2]
 
     # Normalize digits only
@@ -291,13 +323,35 @@ def normalize_codes(codes: List[str]) -> List[str]:
         if not code:
             continue
 
+        full: Optional[str] = None
+
+        # Explicit prefixes
         if code.startswith(("sh", "sz", "bj")):
             full = code
+        elif code.startswith("hk"):
+            tail = code[2:]
+            if tail.isdigit():
+                tail = tail.zfill(5)
+            else:
+                tail = tail.upper()
+            full = "hk" + tail
         else:
-            prefix = infer_exchange_prefix(code)
-            if not prefix:
+            # Digits only
+            if code.isdigit():
+                if len(code) == 6:
+                    prefix = infer_exchange_prefix(code)
+                    if not prefix:
+                        continue
+                    full = prefix + code
+                elif 1 <= len(code) <= 5:
+                    # Treat as HK numeric code
+                    full = "hk" + code.zfill(5)
+                else:
+                    continue
+            else:
+                # Non-digit and no explicit prefix => not a direct code
+                # Leave for alias/suggest resolution
                 continue
-            full = prefix + code
 
         if full not in seen:
             seen.add(full)
@@ -348,6 +402,46 @@ def parse_sina_line(line: str) -> Optional[Dict[str, object]]:
         content = content[1:-1]
 
     fields = content.split(",") if content else []
+    exchange = var_name[:2]
+    code_digits = var_name[2:]
+
+    # Hong Kong format (19 fields)
+    if exchange == "hk":
+        if len(fields) < 19 or (len(fields) == 1 and not fields[0]):
+            return None
+        name_cn = fields[1]
+        current_price = _safe_float(fields[2])
+        prev_close = _safe_float(fields[3])
+        high_price = _safe_float(fields[4])
+        low_price = _safe_float(fields[5])
+        today_open = _safe_float(fields[6])
+        bid_price = _safe_float(fields[9])
+        ask_price = _safe_float(fields[10])
+        amount_hkd = _safe_float(fields[11])
+        volume_shares = _safe_int(fields[12])
+        trade_date = fields[17] if len(fields) > 17 else ""
+        trade_time = fields[18] if len(fields) > 18 else ""
+
+        return {
+            "exchange": exchange,
+            "code": code_digits,
+            "name": name_cn,
+            "current": current_price,
+            "prev_close": prev_close,
+            "open": today_open,
+            "high": high_price,
+            "low": low_price,
+            "bid": bid_price,
+            "ask": ask_price,
+            "volume_shares": volume_shares,
+            "amount_yuan": amount_hkd,  # amount in HKD for HK market
+            "buys": [],  # hk endpoint does not provide 5-level book here
+            "sells": [],
+            "date": trade_date,
+            "time": trade_time,
+        }
+
+    # A-share format (>=32 fields)
     if len(fields) < 32 or (len(fields) == 1 and not fields[0]):
         # invalid or empty
         return None
@@ -385,9 +479,6 @@ def parse_sina_line(line: str) -> Optional[Dict[str, object]]:
 
     trade_date = fields[30] if len(fields) > 30 else ""
     trade_time = fields[31] if len(fields) > 31 else ""
-
-    exchange = var_name[:2]
-    code_digits = var_name[2:]
 
     return {
         "exchange": exchange,
@@ -476,17 +567,27 @@ def print_quote_line(quote: Dict[str, object]) -> None:
     ttime = str(quote.get("time") or "")
 
     # Simple aligned one-line output
+    if code_display.startswith("hk"):
+        volume_part = f"成交量 {volume_shares}股 成交额 {format_number(amount_yuan / 1e8, 2)}亿"
+        ratio_part = ""  # HK: skip 委比/买卖比
+    else:
+        volume_part = f"成交量 {volume_shares // 100}手 成交额 {format_number(amount_yuan / 1e8, 2)}亿"
+        ratio_part = f"| 委比 {format_number(order_ratio, 2)}% 买卖比 {('∞' if buy_sell_ratio == float('inf') else format_number(buy_sell_ratio, 2))} "
+
     line = (
         f"{code_display} {name_display} | 现价 {format_number(current_price, 2)} "
         f"| 涨跌 {format_number(change, 2)} {format_number(change_pct, 2)}% "
-        f"| 成交量 {volume_shares // 100}手 成交额 {format_number(amount_yuan / 1e8, 2)}亿 "
-        f"| 委比 {format_number(order_ratio, 2)}% 买卖比 {('∞' if buy_sell_ratio == float('inf') else format_number(buy_sell_ratio, 2))} "
-        f"| {tdate} {ttime}"
+        f"| {volume_part} "
+        f"{ratio_part}| {tdate} {ttime}"
     )
     print(line)
 
 
 def print_order_book(quote: Dict[str, object]) -> None:
+    # HK sources do not provide five-level order book in this endpoint
+    if str(quote.get("exchange")) == "hk":
+        print("  当前接口不提供港股五档盘口。")
+        return
     buys: List[Tuple[int, float]] = quote.get("buys") or []
     sells: List[Tuple[int, float]] = quote.get("sells") or []
 
@@ -529,12 +630,12 @@ def query_and_display(codes_or_names: List[str], show_detail: bool = False) -> N
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="A股实时行情查询（Sina）")
+    parser = argparse.ArgumentParser(description="A股/港股实时行情查询（Sina）")
     parser.add_argument(
         "codes",
         nargs="*",
         help=(
-            "标的代码或名称，支持：600519、sh600519、浦发银行、上证指数、科创50 等，可多只"
+            "标的代码或名称，支持：600519、sh600519、浦发银行、上证指数、科创50、00700、hk00700、恒生指数 等，可多只"
         ),
     )
     parser.add_argument("-l", "--loop", action="store_true", help="循环刷新显示")
@@ -548,7 +649,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Interactive prompt loop: only 'q' exits
         while True:
             try:
-                code_input = input("请输入A股代码(如 600519 或 多个用空格分隔，输入 q 退出): ").strip()
+                code_input = input("请输入代码/名称(如 600519、浦发银行、00700、恒生指数；多只用空格分隔，输入 q 退出): ").strip()
             except EOFError:
                 # EOF or non-interactive stdin; exit gracefully
                 return 0
