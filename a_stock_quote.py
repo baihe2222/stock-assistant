@@ -675,6 +675,59 @@ def fetch_daily_klines_from_eastmoney(full_code: str, limit: int = 130, timeout:
     return result
 
 
+def fetch_minute_klines_from_eastmoney(full_code: str, klt: int = 60, limit: int = 200, timeout: float = 6.0) -> List[Dict[str, object]]:
+    """Fetch intraday minute-level K-line data (e.g., 60-min) for a stock from EastMoney.
+    
+    klt examples:
+      1: 1-minute, 5: 5-minute, 15: 15-minute, 30: 30-minute, 60: 60-minute
+    Returns a list of dicts with keys:
+      datetime, open, close, high, low, volume, amount, amplitude_pct, change_pct, change_amt, turnover_pct
+    """
+    secid = _get_eastmoney_secid(full_code)
+    if not secid:
+        return []
+    klt_val = int(klt)
+    url = (
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+        f"?secid={urllib.parse.quote(secid)}&klt={klt_val}&fqt=1&lmt={int(limit)}"
+        "&end=20500101&iscca=1&ut=fa5fd1943c7b386f172d6893dbfba10b"
+        "&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+    )
+    headers = {
+        "Referer": "https://quote.eastmoney.com/",
+        "User-Agent": SINA_HEADERS.get("User-Agent", "Mozilla/5.0"),
+        "Accept": "application/json, text/plain, */*",
+    }
+    data = _http_get_json(url, headers=headers, timeout=timeout)
+    result: List[Dict[str, object]] = []
+    try:
+        klines = ((data or {}).get("data") or {}).get("klines") or []
+    except Exception:
+        klines = []
+    for rec in klines:
+        # rec like: "YYYY-MM-DD HH:MM,open,close,high,low,volume,amount,amplitude,chg_pct,chg_amt,turnover"
+        try:
+            parts = str(rec).split(",")
+            if len(parts) < 11:
+                continue
+            result.append({
+                "datetime": parts[0],
+                "open": _safe_float(parts[1]),
+                "close": _safe_float(parts[2]),
+                "high": _safe_float(parts[3]),
+                "low": _safe_float(parts[4]),
+                "volume": _safe_float(parts[5]),
+                "amount": _safe_float(parts[6]),
+                "amplitude_pct": _safe_float(parts[7]),
+                "change_pct": _safe_float(parts[8]),
+                "change_amt": _safe_float(parts[9]),
+                "turnover_pct": _safe_float(parts[10]),
+            })
+        except Exception:
+            continue
+    return result
+
+
 def _simple_moving_average(values: List[float], window: int) -> List[float]:
     if window <= 0:
         return []
@@ -929,27 +982,36 @@ def query_and_display(codes_or_names: List[str], show_detail: bool = False) -> N
 
         full = f"{exchange}{code_digits}"
         if exchange in {"sh", "sz", "bj"}:
-            bars = fetch_daily_klines_from_eastmoney(full, limit=130)
-            if bars:
-                # Turnover rate: use last record
-                last_turnover = float(bars[-1].get("turnover_pct") or 0.0)
+            # Daily bars for turnover/KDJ/MACD
+            bars_daily = fetch_daily_klines_from_eastmoney(full, limit=130)
+            if bars_daily:
+                # Turnover rate: use last daily record
+                last_turnover = float(bars_daily[-1].get("turnover_pct") or 0.0)
                 turnover_pct_str = _format_percent(last_turnover)
 
-                # MA12 position: compute SMA(12) from closes, compare with current price (not last close)
-                closes = [float(b.get("close") or 0.0) for b in bars]
-                if len(closes) >= 12:
-                    ma12_list = _simple_moving_average(closes, 12)
-                    if ma12_list:
-                        ma12 = float(ma12_list[-1])
-                        if ma12 != 0:
-                            diff_pct = (current_price - ma12) / ma12 * 100.0
-                            ma12_pos_str = _format_percent(diff_pct)
-
-                j_val = compute_kdj_j(bars)
+                # KDJ_J and MACD based on daily bars
+                j_val = compute_kdj_j(bars_daily)
                 if j_val is not None:
                     kdj_j_str = format_number(float(j_val), 2)
+                macd_status_str = compute_macd_status(bars_daily)
 
-                macd_status_str = compute_macd_status(bars)
+            # MA12 position based on 60-minute bars; fall back to daily if unavailable
+            bars_60m = fetch_minute_klines_from_eastmoney(full, klt=60, limit=200)
+            closes_60m = [float(b.get("close") or 0.0) for b in bars_60m]
+            ma12_value: Optional[float] = None
+            if len(closes_60m) >= 12:
+                ma12_list_60m = _simple_moving_average(closes_60m, 12)
+                if ma12_list_60m:
+                    ma12_value = float(ma12_list_60m[-1])
+            if ma12_value is None and bars_daily:
+                closes_daily = [float(b.get("close") or 0.0) for b in bars_daily]
+                if len(closes_daily) >= 12:
+                    ma12_list_daily = _simple_moving_average(closes_daily, 12)
+                    if ma12_list_daily:
+                        ma12_value = float(ma12_list_daily[-1])
+            if ma12_value is not None and ma12_value != 0:
+                diff_pct = (current_price - ma12_value) / ma12_value * 100.0
+                ma12_pos_str = _format_percent(diff_pct)
 
         elif exchange == "hk":
             # HK not computed for now
