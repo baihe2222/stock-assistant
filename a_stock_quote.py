@@ -133,6 +133,109 @@ def normalize_codes(codes: List[str]) -> List[str]:
     return normalized
 
 
+def map_em_market_to_prefix(market_type: str, jys: str) -> Optional[str]:
+    """Map Eastmoney market fields to Sina exchange prefix.
+
+    Eastmoney example fields:
+      - MarketType: "1" for 沪A, "2" for 深A (observed)
+      - JYS: "2" for 沪市, "6" for 深市 (observed)
+    We try both with fallbacks.
+    """
+    # Prefer JYS if present
+    if jys == "2":
+        return "sh"
+    if jys == "6":
+        return "sz"
+    # Fallback to MarketType
+    if market_type == "1":
+        return "sh"
+    if market_type == "2":
+        return "sz"
+    return None
+
+
+def em_name_search(keyword: str, limit: int = 5, timeout: float = 6.0) -> List[str]:
+    """Search company/stock by name or pinyin via Eastmoney suggest API.
+
+    Returns a list of prefixed codes (e.g., ["sh600519"]).
+    """
+    if not keyword:
+        return []
+
+    # Documented endpoint observed in practice
+    import json
+    import urllib.parse
+
+    query = urllib.parse.quote(keyword)
+    url = (
+        "https://searchapi.eastmoney.com/api/suggest/get?input="
+        + query + "&type=14"
+    )
+
+    try:
+        text = http_get_text(url, headers={"User-Agent": SINA_HEADERS["User-Agent"]}, timeout=timeout)
+    except Exception:
+        return []
+
+    try:
+        data = json.loads(text)
+    except Exception:
+        return []
+
+    table = (data or {}).get("QuotationCodeTable") or {}
+    items = table.get("Data") or []
+
+    results: List[str] = []
+    for item in items:
+        code = str(item.get("Code") or "").strip()
+        market_type = str(item.get("MarketType") or "").strip()
+        jys = str(item.get("JYS") or "").strip()
+        prefix = map_em_market_to_prefix(market_type, jys)
+        if code and prefix:
+            results.append(prefix + code)
+        if len(results) >= limit:
+            break
+    return results
+
+
+def tencent_name_search(keyword: str, limit: int = 5, timeout: float = 6.0) -> List[str]:
+    """Search via Tencent smartbox API; supports Chinese and sometimes pinyin.
+
+    Response example snippet:
+      v_hint="sh~600519~贵州茅台~gzmt~GP-A" ...
+
+    We'll parse tokens separated by "~", where index 0 may be exchange tag like "sh" or code w/ suffix.
+    """
+    if not keyword:
+        return []
+
+    import re
+    import urllib.parse
+
+    url = "https://smartbox.gtimg.cn/s3/?t=all&q=" + urllib.parse.quote(keyword)
+    try:
+        text = http_get_text(url, headers={"User-Agent": SINA_HEADERS["User-Agent"]}, timeout=timeout)
+    except Exception:
+        return []
+
+    # Aggregate all occurrences of pattern like sh~600519~...
+    # The response uses JS-like variables; simplest is to find patterns of two tokens like (sh|sz|bj)~(\d{6})
+    matches = re.findall(r'(?:^|[=,])([^"\n\r]*sh~\d{6}[^"\n\r]*|[^"\n\r]*sz~\d{6}[^"\n\r]*|[^"\n\r]*bj~\d{6}[^"\n\r]*)', text)
+    results: List[str] = []
+    for m in matches:
+        parts = m.split("~")
+        if len(parts) >= 2:
+            ex = parts[0].strip().lower()
+            code = parts[1].strip()
+            if ex in {"sh", "sz", "bj"} and len(code) == 6 and code.isdigit():
+                pref = ex + code
+                if pref not in results:
+                    results.append(pref)
+        if len(results) >= limit:
+            break
+    return results
+
+
 def _safe_float(value: str) -> float:
     try:
         return float(value)
@@ -358,15 +461,16 @@ def query_and_display(codes: List[str], show_detail: bool = False) -> None:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="A股实时行情查询（Sina）")
-    parser.add_argument("codes", nargs="*", help="A股代码，如 600519 或 sz000001，可多只")
+    parser.add_argument("codes", nargs="*", help="A股代码或公司名，如 600519/贵州茅台，可多项")
     parser.add_argument("-l", "--loop", action="store_true", help="循环刷新显示")
     parser.add_argument("-i", "--interval", type=float, default=2.0, help="刷新间隔秒(配合 --loop)")
     parser.add_argument("-d", "--detail", action="store_true", help="显示五档盘口")
+    parser.add_argument("--max-matches", type=int, default=3, help="公司名匹配时最多取前N只")
 
     args = parser.parse_args(argv)
 
-    codes: List[str] = args.codes
-    if not codes:
+    inputs: List[str] = args.codes
+    if not inputs:
         # Interactive fallback
         try:
             code_input = input("请输入A股代码(如 600519 或 多个用空格分隔): ").strip()
@@ -375,7 +479,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not code_input:
             print("未输入代码。")
             return 1
-        codes = code_input.split()
+        inputs = code_input.split()
+
+    # Expand names to codes via Eastmoney
+    codes: List[str] = []
+    for token in inputs:
+        # Heuristic: if it's 6-digit or starts with sh/sz/bj, treat as code; otherwise treat as name
+        raw = token.strip()
+        raw_l = raw.lower()
+        is_code_like = (raw_l.startswith(("sh", "sz", "bj")) or (raw.isdigit() and len(raw) == 6))
+        if is_code_like:
+            codes.append(raw)
+            continue
+        # name/pinyin => search
+        matches = em_name_search(raw, limit=max(1, int(args.max_matches)))
+        if not matches:
+            matches = tencent_name_search(raw, limit=max(1, int(args.max_matches)))
+        if not matches:
+            print(f"未找到名称匹配：{raw}")
+        else:
+            codes.extend(matches)
 
     if args.loop:
         try:
