@@ -41,6 +41,7 @@ except Exception:  # requests may be unavailable
 
 import urllib.request
 import urllib.error
+import urllib.parse
 
 
 SINA_QUOTE_ENDPOINT = "https://hq.sinajs.cn/list="
@@ -53,6 +54,8 @@ SINA_HEADERS = {
     ),
     "Accept-Charset": "GBK,utf-8;q=0.7,*;q=0.3",
 }
+
+SINA_SUGGEST_ENDPOINT = "https://suggest3.sinajs.cn/suggest"
 
 
 def http_get_text(url: str, headers: Dict[str, str], timeout: float) -> str:
@@ -70,6 +73,175 @@ def http_get_text(url: str, headers: Dict[str, str], timeout: float) -> str:
             return data.decode("gbk", errors="ignore")
         except Exception:
             return data.decode("utf-8", errors="ignore")
+
+
+def parse_suggest_value(text: str) -> List[Dict[str, str]]:
+    """Parse Sina suggest API raw text to a list of entries.
+
+    The response format is like:
+        var suggestvalue="name,type,code,full,display,...;name2,type2,code2,full2,display2,...";
+
+    Returns a list of dicts with minimal fields: name, type, code, full.
+    """
+    if not text:
+        return []
+
+    # Extract the content between the first and the last double quotes
+    start = text.find('"')
+    end = text.rfind('"')
+    if start == -1 or end == -1 or end <= start:
+        return []
+
+    payload = text[start + 1:end]
+    if not payload:
+        return []
+
+    entries: List[Dict[str, str]] = []
+    for rec in payload.split(";"):
+        if not rec:
+            continue
+        fields = rec.split(",")
+        if len(fields) < 4:
+            continue
+        name = fields[0].strip()
+        typ = fields[1].strip()
+        code = fields[2].strip()
+        full = fields[3].strip()
+        entries.append({
+            "name": name,
+            "type": typ,
+            "code": code,
+            "full": full,
+        })
+    return entries
+
+
+def suggest_full_codes_for_key(keyword: str, timeout: float = 5.0) -> List[str]:
+    """Query Sina suggest API and return candidate full codes like sh600000.
+
+    Filters to exchange-prefixed codes that our quote endpoint can handle: sh/sz/bj.
+    """
+    key = keyword.strip()
+    if not key:
+        return []
+    urls = [
+        f"{SINA_SUGGEST_ENDPOINT}/type=11&key={urllib.parse.quote(key)}",  # A股优先（正确路径样式）
+        f"{SINA_SUGGEST_ENDPOINT}/key={urllib.parse.quote(key)}",           # 兜底（正确路径样式）
+    ]
+
+    result: List[str] = []
+    seen = set()
+
+    for url in urls:
+        try:
+            text = http_get_text(url, headers=SINA_HEADERS, timeout=timeout)
+        except Exception:
+            continue
+        entries = parse_suggest_value(text)
+        for e in entries:
+            full = (e.get("full") or "").lower()
+            if not full:
+                continue
+            if not (full.startswith("sh") or full.startswith("sz") or full.startswith("bj")):
+                # skip non-A share codes like of (fund) or futures codes
+                continue
+            if full not in seen:
+                seen.add(full)
+                result.append(full)
+
+        if result:
+            break
+
+    return result
+
+
+def build_index_alias_map() -> Dict[str, str]:
+    """Builtin index name aliases to full codes.
+
+    Covers common indices for convenience.
+    """
+    aliases: Dict[str, str] = {
+        # Shanghai Composite
+        "上证": "sh000001",
+        "上证指数": "sh000001",
+        "上证综指": "sh000001",
+
+        # SZ Component Index
+        "深证成指": "sz399001",
+        "深成指": "sz399001",
+
+        # ChiNext
+        "创业板": "sz399006",
+        "创业板指": "sz399006",
+        "创业板指数": "sz399006",
+
+        # STAR 50
+        "科创50": "sh000688",
+        "科创板50": "sh000688",
+        "科创50指数": "sh000688",
+
+        # HS300
+        "沪深300": "sh000300",
+        "沪深三百": "sh000300",
+
+        # SSE 50
+        "上证50": "sh000016",
+        "上证五十": "sh000016",
+
+        # CSI 500
+        "中证500": "sh000905",
+        # CSI 1000
+        "中证1000": "sh000852",
+    }
+    # Also allow ascii fallbacks (no change needed for Chinese case)
+    return aliases
+
+
+def resolve_inputs_to_prefixed_codes(inputs: List[str]) -> List[str]:
+    """Resolve a list of user inputs (codes or names) to prefixed codes.
+
+    Resolution order per token:
+      1) If it looks like a code (with/without prefix), normalize directly
+      2) Builtin index aliases
+      3) Sina suggest API (first sh/sz/bj result)
+    """
+    alias_map = build_index_alias_map()
+
+    resolved: List[str] = []
+    seen = set()
+    for raw in inputs:
+        token = (raw or "").strip()
+        if not token:
+            continue
+
+        # 1) Direct code normalization
+        direct = normalize_codes([token])
+        if direct:
+            for full in direct:
+                if full not in seen:
+                    seen.add(full)
+                    resolved.append(full)
+            continue
+
+        # 2) Builtin alias
+        alias_code = alias_map.get(token)
+        if alias_code and alias_code not in seen:
+            seen.add(alias_code)
+            resolved.append(alias_code)
+            continue
+
+        # 3) Suggest API
+        candidates = suggest_full_codes_for_key(token)
+        if candidates:
+            first = candidates[0]
+            if first not in seen:
+                seen.add(first)
+                resolved.append(first)
+            continue
+
+        # Not resolved; skip silently (query_and_display will handle empty)
+
+    return resolved
 
 
 def infer_exchange_prefix(stock_code: str) -> Optional[str]:
@@ -334,10 +506,10 @@ def print_order_book(quote: Dict[str, object]) -> None:
             print(f"    买{level}: 价 {format_number(price, 2)} 量 {vol}股")
 
 
-def query_and_display(codes: List[str], show_detail: bool = False) -> None:
-    normalized = normalize_codes(codes)
+def query_and_display(codes_or_names: List[str], show_detail: bool = False) -> None:
+    normalized = resolve_inputs_to_prefixed_codes(codes_or_names)
     if not normalized:
-        print("未识别到有效的A股代码。示例：600519 或 sh600519")
+        print("未识别到有效标的。可输入代码或名称，如 600519、浦发银行、上证指数、科创50")
         return
 
     try:
@@ -358,7 +530,13 @@ def query_and_display(codes: List[str], show_detail: bool = False) -> None:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="A股实时行情查询（Sina）")
-    parser.add_argument("codes", nargs="*", help="A股代码，如 600519 或 sz000001，可多只")
+    parser.add_argument(
+        "codes",
+        nargs="*",
+        help=(
+            "标的代码或名称，支持：600519、sh600519、浦发银行、上证指数、科创50 等，可多只"
+        ),
+    )
     parser.add_argument("-l", "--loop", action="store_true", help="循环刷新显示")
     parser.add_argument("-i", "--interval", type=float, default=2.0, help="刷新间隔秒(配合 --loop)")
     parser.add_argument("-d", "--detail", action="store_true", help="显示五档盘口")
