@@ -33,6 +33,8 @@ import time
 import os
 import atexit
 from typing import Dict, List, Optional, Tuple
+import json
+import math
 
 try:
     import requests  # type: ignore
@@ -585,6 +587,188 @@ def format_number(value: float, digits: int = 2) -> str:
     return f"{value:.{digits}f}"
 
 
+# ------------------------------
+# EastMoney K-line helpers
+# ------------------------------
+
+def _get_eastmoney_secid(full_code: str) -> Optional[str]:
+    """Map a Sina-style full code to EastMoney secid.
+
+    EastMoney secid format: "<market>.<code>", where market is:
+      - 1 for SH
+      - 0 for SZ (and BJ commonly also uses 0 here)
+      - 116 for HK (not used for indicators below)
+    """
+    code = (full_code or "").strip().lower()
+    if not code or len(code) < 3:
+        return None
+    prefix = code[:2]
+    digits = code[2:]
+    if not digits:
+        return None
+    if prefix == "sh":
+        return f"1.{digits}"
+    if prefix == "sz" or prefix == "bj":
+        return f"0.{digits}"
+    if prefix == "hk":
+        # HK market id commonly 116
+        return f"116.{digits.zfill(5)}"
+    return None
+
+
+def _http_get_json(url: str, headers: Dict[str, str], timeout: float) -> Dict[str, object]:
+    text = http_get_text(url, headers=headers, timeout=timeout)
+    try:
+        return json.loads(text)
+    except Exception:
+        return {}
+
+
+def fetch_daily_klines_from_eastmoney(full_code: str, limit: int = 130, timeout: float = 6.0) -> List[Dict[str, object]]:
+    """Fetch daily K-line data for a stock from EastMoney.
+
+    Returns a list of dicts with keys:
+      date, open, close, high, low, volume, amount, amplitude_pct, change_pct, change_amt, turnover_pct
+    """
+    secid = _get_eastmoney_secid(full_code)
+    if not secid:
+        return []
+    # klt=101 => 日K; fqt=1 前复权; lmt=limit 条
+    url = (
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+        f"?secid={urllib.parse.quote(secid)}&klt=101&fqt=1&lmt={int(limit)}"
+        "&end=20500101&iscca=1&ut=fa5fd1943c7b386f172d6893dbfba10b"
+        "&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+    )
+    headers = {
+        "Referer": "https://quote.eastmoney.com/",
+        "User-Agent": SINA_HEADERS.get("User-Agent", "Mozilla/5.0"),
+        "Accept": "application/json, text/plain, */*",
+    }
+    data = _http_get_json(url, headers=headers, timeout=timeout)
+    result: List[Dict[str, object]] = []
+    try:
+        klines = ((data or {}).get("data") or {}).get("klines") or []
+    except Exception:
+        klines = []
+    for rec in klines:
+        # rec like: "YYYY-MM-DD,open,close,high,low,volume,amount,amplitude,chg_pct,chg_amt,turnover"
+        try:
+            parts = str(rec).split(",")
+            if len(parts) < 11:
+                continue
+            result.append({
+                "date": parts[0],
+                "open": _safe_float(parts[1]),
+                "close": _safe_float(parts[2]),
+                "high": _safe_float(parts[3]),
+                "low": _safe_float(parts[4]),
+                "volume": _safe_float(parts[5]),
+                "amount": _safe_float(parts[6]),
+                "amplitude_pct": _safe_float(parts[7]),
+                "change_pct": _safe_float(parts[8]),
+                "change_amt": _safe_float(parts[9]),
+                "turnover_pct": _safe_float(parts[10]),
+            })
+        except Exception:
+            continue
+    return result
+
+
+def _simple_moving_average(values: List[float], window: int) -> List[float]:
+    if window <= 0:
+        return []
+    out: List[float] = []
+    cumsum = 0.0
+    for i, v in enumerate(values):
+        cumsum += v
+        if i >= window:
+            cumsum -= values[i - window]
+        if i + 1 >= window:
+            out.append(cumsum / window)
+    return out
+
+
+def _ema(values: List[float], period: int) -> List[float]:
+    if period <= 0 or not values:
+        return []
+    k = 2.0 / (period + 1.0)
+    ema_vals: List[float] = []
+    ema_prev = values[0]
+    ema_vals.append(ema_prev)
+    for i in range(1, len(values)):
+        ema_prev = values[i] * k + ema_prev * (1.0 - k)
+        ema_vals.append(ema_prev)
+    return ema_vals
+
+
+def compute_kdj_j(bars: List[Dict[str, object]], period: int = 9) -> Optional[float]:
+    if not bars:
+        return None
+    highs = [float(b.get("high") or 0.0) for b in bars]
+    lows = [float(b.get("low") or 0.0) for b in bars]
+    closes = [float(b.get("close") or 0.0) for b in bars]
+    if len(closes) == 0:
+        return None
+    k_prev = 50.0
+    d_prev = 50.0
+    for i in range(len(closes)):
+        start = max(0, i - period + 1)
+        window_high = max(highs[start:i + 1])
+        window_low = min(lows[start:i + 1])
+        denom = (window_high - window_low)
+        rsv = 0.0 if denom <= 0 else (closes[i] - window_low) / denom * 100.0
+        k_curr = (2.0 / 3.0) * k_prev + (1.0 / 3.0) * rsv
+        d_curr = (2.0 / 3.0) * d_prev + (1.0 / 3.0) * k_curr
+        k_prev, d_prev = k_curr, d_curr
+    j = 3.0 * k_prev - 2.0 * d_prev
+    return j
+
+
+def compute_macd_status(bars: List[Dict[str, object]]) -> str:
+    """Return '金叉' / '死叉' / '—' based on last two DIF-DEA relationships."""
+    closes = [float(b.get("close") or 0.0) for b in bars]
+    if len(closes) < 2:
+        return "—"
+    ema12 = _ema(closes, 12)
+    ema26 = _ema(closes, 26)
+    n = min(len(ema12), len(ema26))
+    if n < 2:
+        return "—"
+    dif = [ema12[i] - ema26[i] for i in range(n)]
+    dea = _ema(dif, 9)
+    if len(dea) < 2:
+        return "—"
+    last = dif[-1] - dea[-1]
+    prev = dif[-2] - dea[-2]
+    if last >= 0 and prev < 0:
+        return "金叉"
+    if last <= 0 and prev > 0:
+        return "死叉"
+    return "—"
+
+
+def _format_percent(value: Optional[float], digits: int = 2) -> str:
+    if value is None or math.isnan(value):
+        return "-"
+    return f"{value:.{digits}f}%"
+
+
+def _print_table(headers: List[str], rows: List[List[str]]) -> None:
+    # compute column widths
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for idx, cell in enumerate(row):
+            widths[idx] = max(widths[idx], len(cell))
+    # header
+    header_line = " ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
+    sep_line = " ".join("-" * widths[i] for i in range(len(headers)))
+    print(header_line)
+    print(sep_line)
+    for row in rows:
+        print(" ".join((row[i]).ljust(widths[i]) for i in range(len(headers))))
+
+
 def print_quote_line(quote: Dict[str, object]) -> None:
     current_price = float(quote.get("current") or 0.0)
     prev_close = float(quote.get("prev_close") or 0.0)
@@ -653,13 +837,88 @@ def query_and_display(codes_or_names: List[str], show_detail: bool = False) -> N
         print(f"请求行情失败：{exc}")
         return
 
+    # Build table rows
+    headers = [
+        "代码",
+        "名称",
+        "现价",
+        "涨跌幅",
+        "换手率",
+        "距MA12",
+        "KDJ_J",
+        "MACD",
+        "时间",
+    ]
+    rows: List[List[str]] = []
+
+    details: List[Tuple[str, Dict[str, object]]] = []
+
     for full_code in normalized:
         quote = quotes.get(full_code)
         if not quote:
-            print(f"{full_code}: 无数据")
+            rows.append([full_code, "-", "-", "-", "-", "-", "-", "-", "-"])
             continue
-        print_quote_line(quote)
-        if show_detail:
+
+        exchange = str(quote.get("exchange") or "")
+        code_digits = str(quote.get("code") or "")
+        name_display = str(quote.get("name") or "-")
+        current_price = float(quote.get("current") or 0.0)
+        prev_close = float(quote.get("prev_close") or 0.0)
+        change_pct = (current_price - prev_close) / prev_close * 100.0 if prev_close > 0 else 0.0
+        tdate = str(quote.get("date") or "")
+        ttime = str(quote.get("time") or "")
+
+        turnover_pct_str = "-"
+        ma12_pos_str = "-"
+        kdj_j_str = "-"
+        macd_status_str = "-"
+
+        full = f"{exchange}{code_digits}"
+        if exchange in {"sh", "sz", "bj"}:
+            bars = fetch_daily_klines_from_eastmoney(full, limit=130)
+            if bars:
+                # Turnover rate: use last record
+                last_turnover = float(bars[-1].get("turnover_pct") or 0.0)
+                turnover_pct_str = _format_percent(last_turnover)
+
+                # MA12 position: compute SMA(12) from closes, compare with current price (not last close)
+                closes = [float(b.get("close") or 0.0) for b in bars]
+                if len(closes) >= 12:
+                    ma12_list = _simple_moving_average(closes, 12)
+                    if ma12_list:
+                        ma12 = float(ma12_list[-1])
+                        if ma12 != 0:
+                            diff_pct = (current_price - ma12) / ma12 * 100.0
+                            ma12_pos_str = _format_percent(diff_pct)
+
+                j_val = compute_kdj_j(bars)
+                if j_val is not None:
+                    kdj_j_str = format_number(float(j_val), 2)
+
+                macd_status_str = compute_macd_status(bars)
+
+        elif exchange == "hk":
+            # HK not computed for now
+            pass
+
+        rows.append([
+            f"{exchange}{code_digits}",
+            name_display,
+            format_number(current_price, 2),
+            _format_percent(change_pct),
+            turnover_pct_str,
+            ma12_pos_str,
+            kdj_j_str,
+            macd_status_str,
+            f"{tdate} {ttime}".strip(),
+        ])
+
+        details.append((full, quote))
+
+    _print_table(headers, rows)
+
+    if show_detail:
+        for _, quote in details:
             print_order_book(quote)
 
 
