@@ -801,14 +801,24 @@ def print_quote_line(quote: Dict[str, object]) -> None:
     print(line)
 
 
-def print_quote_kv(quote: Dict[str, object]) -> None:
+def print_quote_kv(
+    quote: Dict[str, object],
+    change_amt_str: Optional[str] = None,
+    ma12_pos_str: Optional[str] = None,
+    kdj_j_str: Optional[str] = None,
+    macd_status_str: Optional[str] = None,
+) -> None:
     """Print quote in key-value Chinese label style.
 
     Example:
       名称: 浦发银行
       代码: 600000
       现价: 10.92
+      涨跌额: 0.07
       涨跌幅: 0.64%
+      距MA12: 1.23%
+      KDJ_J: 85.60
+      MACD: 金叉
       成交量: 1234手
       成交额: 12.34亿
       委比: 10.11%
@@ -831,7 +841,15 @@ def print_quote_kv(quote: Dict[str, object]) -> None:
     print(f"名称: {name_display}")
     print(f"代码: {code_digits}")
     print(f"现价: {format_number(current_price, 2)}")
+    # 涨跌额（现价-昨收）
+    if change_amt_str is None:
+        change_amt_str = format_number(current_price - prev_close, 2)
+    print(f"涨跌额: {change_amt_str}")
     print(f"涨跌幅: {format_number(change_pct, 2)}%")
+    # 技术指标：距MA12/KDJ_J/MACD（若无则用 - 占位）
+    print(f"距MA12: {str(ma12_pos_str) if ma12_pos_str else '-'}")
+    print(f"KDJ_J: {str(kdj_j_str) if kdj_j_str else '-'}")
+    print(f"MACD: {str(macd_status_str) if macd_status_str else '-'}")
 
     if exchange == "hk":
         print(f"成交量: {volume_shares}股")
@@ -937,8 +955,15 @@ def query_and_display(codes_or_names: List[str], show_detail: bool = False) -> N
             # HK not computed for now
             pass
 
-        # Print in key-value style
-        print_quote_kv(quote)
+        # Print in key-value style，补充：涨跌额、距MA12、KDJ_J、MACD
+        change_amt_str = format_number(current_price - prev_close, 2)
+        print_quote_kv(
+            quote,
+            change_amt_str=change_amt_str,
+            ma12_pos_str=ma12_pos_str,
+            kdj_j_str=kdj_j_str,
+            macd_status_str=macd_status_str,
+        )
 
         details.append((full, quote))
 
