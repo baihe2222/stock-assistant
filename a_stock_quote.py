@@ -30,6 +30,8 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+import os
+import atexit
 from typing import Dict, List, Optional, Tuple
 
 try:
@@ -56,6 +58,38 @@ SINA_HEADERS = {
 }
 
 SINA_SUGGEST_ENDPOINT = "https://suggest3.sinajs.cn/suggest"
+
+
+try:
+    import readline  # type: ignore
+    HAS_READLINE = True
+except Exception:
+    readline = None  # type: ignore
+    HAS_READLINE = False
+
+
+def setup_readline_history(history_path: Optional[str] = None) -> None:
+    """Enable arrow-key history for input() and persist it across sessions."""
+    if not HAS_READLINE:
+        return
+    path = history_path or os.path.expanduser("~/.a_stock_quote_history")
+    try:
+        if os.path.exists(path):
+            readline.read_history_file(path)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        readline.set_history_length(1000)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    def _save_history() -> None:
+        try:
+            readline.write_history_file(path)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    atexit.register(_save_history)
 
 
 def http_get_text(url: str, headers: Dict[str, str], timeout: float) -> str:
@@ -647,6 +681,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     codes: List[str] = args.codes
     if not codes:
         # Interactive prompt loop: only 'q' exits
+        setup_readline_history()
         while True:
             try:
                 code_input = input("请输入代码/名称(如 600519、浦发银行、00700、恒生指数；多只用空格分隔，输入 q 退出): ").strip()
@@ -657,6 +692,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 0
             if not code_input:
                 continue
+            if HAS_READLINE:
+                try:
+                    readline.add_history(code_input)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
             codes = code_input.split()
             query_and_display(codes, show_detail=args.detail)
 
