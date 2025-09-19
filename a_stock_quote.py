@@ -860,6 +860,7 @@ def print_quote_kv(
     ma12_pos_str: Optional[str] = None,
     kdj_j_str: Optional[str] = None,
     macd_status_str: Optional[str] = None,
+    turnover_pct_str: Optional[str] = None,
 ) -> None:
     """Print quote in key-value Chinese label style.
 
@@ -869,6 +870,7 @@ def print_quote_kv(
       现价: 10.92
       涨跌额: 0.07
       涨跌幅: 0.64%
+      换手率: 1.23%
       距MA12: 1.23%
       KDJ_J: 85.60
       MACD: 金叉
@@ -912,6 +914,9 @@ def print_quote_kv(
         print(f"成交额: {format_number(amount_yuan / 1e8, 2)}亿")
         print(f"委比: {format_number(order_ratio, 2)}%")
         print(f"买卖比: {('∞' if buy_sell_ratio == float('inf') else format_number(buy_sell_ratio, 2))}")
+
+    # Turnover rate (换手率)，若无则显示 "-"
+    print(f"换手率: {str(turnover_pct_str) if turnover_pct_str else '-'}")
 
     ts = f"{tdate} {ttime}".strip()
     if ts:
@@ -1025,6 +1030,7 @@ def query_and_display(codes_or_names: List[str], show_detail: bool = False) -> N
             ma12_pos_str=ma12_pos_str,
             kdj_j_str=kdj_j_str,
             macd_status_str=macd_status_str,
+            turnover_pct_str=turnover_pct_str,
         )
 
         details.append((full, quote))
