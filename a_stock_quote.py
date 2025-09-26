@@ -85,6 +85,50 @@ def setup_readline_history(history_path: Optional[str] = None) -> None:
     except Exception:
         pass
 
+    # Improve interactivity: enable prefix history search on Up/Down and
+    # reduce ESC sequence waiting time so arrow keys feel more responsive.
+    try:
+        doc = str(getattr(readline, "__doc__", "")).lower()
+        is_libedit = ("libedit" in doc) or ("editline" in doc)
+
+        if is_libedit:
+            # libedit (common on macOS). Use its 'bind' syntax and ed-search-*
+            try:
+                readline.parse_and_bind("bind -e")  # emacs mode
+            except Exception:
+                pass
+            for cmd in (
+                "bind '^[[A' ed-search-prev-history",
+                "bind '^[[B' ed-search-next-history",
+                # Cover some terminals' modified sequences
+                "bind '^[[1;5A' ed-search-prev-history",
+                "bind '^[[1;5B' ed-search-next-history",
+            ):
+                try:
+                    readline.parse_and_bind(cmd)
+                except Exception:
+                    pass
+        else:
+            # GNU Readline. Use native settings and keymaps.
+            for cmd in (
+                "set editing-mode emacs",
+                "set bell-style none",
+                # Reduce delay waiting for ambiguous ESC sequences (ms)
+                "set keyseq-timeout 20",
+                # Prefix history search with Up/Down (both normal and application mode)
+                r"\"\e[A\": history-search-backward",
+                r"\"\e[B\": history-search-forward",
+                r"\"\eOA\": history-search-backward",
+                r"\"\eOB\": history-search-forward",
+            ):
+                try:
+                    readline.parse_and_bind(cmd)
+                except Exception:
+                    pass
+    except Exception:
+        # Best-effort improvements; ignore if unsupported
+        pass
+
     def _save_history() -> None:
         try:
             readline.write_history_file(path)  # type: ignore[attr-defined]
