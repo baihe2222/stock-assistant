@@ -35,6 +35,8 @@ import atexit
 from typing import Dict, List, Optional, Tuple
 import json
 import math
+import random
+import logging
 
 try:
     import requests  # type: ignore
@@ -47,8 +49,15 @@ import urllib.request
 import urllib.error
 import urllib.parse
 
+# 配置结构化日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 SINA_QUOTE_ENDPOINT = "https://hq.sinajs.cn/list="
+SINA_QUOTE_FALLBACK_ENDPOINT = "https://hq.sina.com.cn/list="  # 备用新浪行情接口
 SINA_HEADERS = {
     # Referer 头有助于避免部分防盗链策略
     "Referer": "https://finance.sina.com.cn/",
@@ -138,21 +147,56 @@ def setup_readline_history(history_path: Optional[str] = None) -> None:
     atexit.register(_save_history)
 
 
-def http_get_text(url: str, headers: Dict[str, str], timeout: float) -> str:
+def http_get_text(url: str, headers: Dict[str, str], timeout: float, max_retries: int = 3) -> str:
     """HTTP GET that returns decoded text (GBK preferred), using requests if available, otherwise urllib.
+    
+    Args:
+        url: 请求URL
+        headers: HTTP请求头
+        timeout: 超时时间（秒）
+        max_retries: 最大重试次数（默认3次）
+    
+    Returns:
+        解码后的文本内容
+    
+    Raises:
+        最后一次请求的异常
     """
-    if HAS_REQUESTS:
-        resp = requests.get(url, headers=headers, timeout=timeout)  # type: ignore[attr-defined]
-        resp.encoding = "gbk"
-        return resp.text
-
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp_obj:
-        data = resp_obj.read()
+    last_exception = None
+    
+    for attempt in range(max_retries + 1):
         try:
-            return data.decode("gbk", errors="ignore")
-        except Exception:
-            return data.decode("utf-8", errors="ignore")
+            if HAS_REQUESTS:
+                resp = requests.get(url, headers=headers, timeout=timeout)  # type: ignore[attr-defined]
+                resp.encoding = "gbk"
+                if attempt > 0:
+                    logger.info(f"请求成功 url={url} attempt={attempt + 1}")
+                return resp.text
+            else:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=timeout) as resp_obj:
+                    data = resp_obj.read()
+                    if attempt > 0:
+                        logger.info(f"请求成功 url={url} attempt={attempt + 1}")
+                    try:
+                        return data.decode("gbk", errors="ignore")
+                    except Exception:
+                        return data.decode("utf-8", errors="ignore")
+        except Exception as e:
+            last_exception = e
+            if attempt < max_retries:
+                # 指数退避 + 抖动（避免惊群效应）
+                base_delay = min(2 ** attempt, 8)  # 最大8秒
+                jitter = random.uniform(0, 0.3 * base_delay)  # 30%抖动
+                delay = base_delay + jitter
+                logger.warning(
+                    f"请求失败，{delay:.2f}秒后重试 url={url} attempt={attempt + 1}/{max_retries + 1} error={str(e)}"
+                )
+                time.sleep(delay)
+            else:
+                logger.error(f"请求最终失败 url={url} attempts={max_retries + 1} error={str(e)}")
+    
+    raise last_exception  # type: ignore
 
 
 def parse_suggest_value(text: str) -> List[Dict[str, str]]:
@@ -584,21 +628,42 @@ def fetch_sina_quotes(prefixed_codes: List[str], timeout: float = 5.0) -> Dict[s
     """Fetch quotes for a list of prefixed codes from Sina.
 
     Returns a dict keyed by full code like "sh600519".
+    \u5c1d\u8bd5\u4e3b\u63a5\u53e3\uff0c\u5931\u8d25\u540e\u5c1d\u8bd5\u5907\u7528\u63a5\u53e3\u3002
     """
     if not prefixed_codes:
         return {}
 
-    url = SINA_QUOTE_ENDPOINT + ",".join(prefixed_codes)
-    text = http_get_text(url, headers=SINA_HEADERS, timeout=timeout)
-
-    result: Dict[str, Dict[str, object]] = {}
-    for line in text.splitlines():
-        parsed = parse_sina_line(line)
-        if not parsed:
-            continue
-        full_code = f"{parsed['exchange']}{parsed['code']}"
-        result[full_code] = parsed
-    return result
+    codes_str = ",".join(prefixed_codes)
+    endpoints = [
+        SINA_QUOTE_ENDPOINT + codes_str,
+        SINA_QUOTE_FALLBACK_ENDPOINT + codes_str,
+    ]
+    
+    last_exception = None
+    for idx, url in enumerate(endpoints):
+        try:
+            text = http_get_text(url, headers=SINA_HEADERS, timeout=timeout, max_retries=3)
+            result: Dict[str, Dict[str, object]] = {}
+            for line in text.splitlines():
+                parsed = parse_sina_line(line)
+                if not parsed:
+                    continue
+                full_code = f"{parsed['exchange']}{parsed['code']}"
+                result[full_code] = parsed
+            
+            if idx > 0:
+                logger.info(f"使用备用接口成功 endpoint={url}")
+            return result
+        except Exception as e:
+            last_exception = e
+            logger.warning(f"接口请求失败 endpoint={url} error={str(e)}")
+            if idx < len(endpoints) - 1:
+                logger.info(f"尝试备用接口 fallback_endpoint={endpoints[idx + 1]}")
+    
+    # 所有接口都失败，抛出异常
+    if last_exception:
+        raise last_exception
+    return {}
 
 
 def compute_order_metrics(quote: Dict[str, object]) -> Tuple[float, float]:
@@ -661,7 +726,7 @@ def _get_eastmoney_secid(full_code: str) -> Optional[str]:
 
 
 def _http_get_json(url: str, headers: Dict[str, str], timeout: float) -> Dict[str, object]:
-    text = http_get_text(url, headers=headers, timeout=timeout)
+    text = http_get_text(url, headers=headers, timeout=timeout, max_retries=3)
     try:
         return json.loads(text)
     except Exception:
@@ -673,50 +738,71 @@ def fetch_daily_klines_from_eastmoney(full_code: str, limit: int = 130, timeout:
 
     Returns a list of dicts with keys:
       date, open, close, high, low, volume, amount, amplitude_pct, change_pct, change_amt, turnover_pct
+    支持主接口失败后使用备用接口。
     """
     secid = _get_eastmoney_secid(full_code)
     if not secid:
         return []
+    
     # klt=101 => 日K; fqt=1 前复权; lmt=limit 条
-    url = (
-        "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-        f"?secid={urllib.parse.quote(secid)}&klt=101&fqt=1&lmt={int(limit)}"
-        "&end=20500101&iscca=1&ut=fa5fd1943c7b386f172d6893dbfba10b"
-        "&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
-    )
+    query_params = f"?secid={urllib.parse.quote(secid)}&klt=101&fqt=1&lmt={int(limit)}&end=20500101&iscca=1&ut=fa5fd1943c7b386f172d6893dbfba10b&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+    
+    # 主接口和备用接口
+    endpoints = [
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get" + query_params,
+        "https://push2.eastmoney.com/api/qt/stock/kline/get" + query_params,
+    ]
+    
     headers = {
         "Referer": "https://quote.eastmoney.com/",
         "User-Agent": SINA_HEADERS.get("User-Agent", "Mozilla/5.0"),
         "Accept": "application/json, text/plain, */*",
     }
-    data = _http_get_json(url, headers=headers, timeout=timeout)
-    result: List[Dict[str, object]] = []
-    try:
-        klines = ((data or {}).get("data") or {}).get("klines") or []
-    except Exception:
-        klines = []
-    for rec in klines:
-        # rec like: "YYYY-MM-DD,open,close,high,low,volume,amount,amplitude,chg_pct,chg_amt,turnover"
+    
+    last_exception = None
+    for idx, url in enumerate(endpoints):
         try:
-            parts = str(rec).split(",")
-            if len(parts) < 11:
-                continue
-            result.append({
-                "date": parts[0],
-                "open": _safe_float(parts[1]),
-                "close": _safe_float(parts[2]),
-                "high": _safe_float(parts[3]),
-                "low": _safe_float(parts[4]),
-                "volume": _safe_float(parts[5]),
-                "amount": _safe_float(parts[6]),
-                "amplitude_pct": _safe_float(parts[7]),
-                "change_pct": _safe_float(parts[8]),
-                "change_amt": _safe_float(parts[9]),
-                "turnover_pct": _safe_float(parts[10]),
-            })
-        except Exception:
-            continue
-    return result
+            data = _http_get_json(url, headers=headers, timeout=timeout)
+            result: List[Dict[str, object]] = []
+            try:
+                klines = ((data or {}).get("data") or {}).get("klines") or []
+            except Exception:
+                klines = []
+            
+            for rec in klines:
+                # rec like: "YYYY-MM-DD,open,close,high,low,volume,amount,amplitude,chg_pct,chg_amt,turnover"
+                try:
+                    parts = str(rec).split(",")
+                    if len(parts) < 11:
+                        continue
+                    result.append({
+                        "date": parts[0],
+                        "open": _safe_float(parts[1]),
+                        "close": _safe_float(parts[2]),
+                        "high": _safe_float(parts[3]),
+                        "low": _safe_float(parts[4]),
+                        "volume": _safe_float(parts[5]),
+                        "amount": _safe_float(parts[6]),
+                        "amplitude_pct": _safe_float(parts[7]),
+                        "change_pct": _safe_float(parts[8]),
+                        "change_amt": _safe_float(parts[9]),
+                        "turnover_pct": _safe_float(parts[10]),
+                    })
+                except Exception:
+                    continue
+            
+            if idx > 0:
+                logger.info(f"东方财富日线数据使用备用接口成功 endpoint={url}")
+            return result
+        except Exception as e:
+            last_exception = e
+            logger.warning(f"东方财富日线数据接口失败 endpoint={url} error={str(e)}")
+            if idx < len(endpoints) - 1:
+                logger.info(f"尝试备用接口 fallback_endpoint={endpoints[idx + 1]}")
+    
+    # 所有接口都失败，返回空列表（避免影响其他功能）
+    logger.error(f"东方财富日线数据所有接口都失败 code={full_code} error={str(last_exception)}")
+    return []
 
 
 def fetch_minute_klines_from_eastmoney(full_code: str, klt: int = 60, limit: int = 200, timeout: float = 6.0) -> List[Dict[str, object]]:
@@ -726,50 +812,71 @@ def fetch_minute_klines_from_eastmoney(full_code: str, klt: int = 60, limit: int
       1: 1-minute, 5: 5-minute, 15: 15-minute, 30: 30-minute, 60: 60-minute
     Returns a list of dicts with keys:
       datetime, open, close, high, low, volume, amount, amplitude_pct, change_pct, change_amt, turnover_pct
+    支持主接口失败后使用备用接口。
     """
     secid = _get_eastmoney_secid(full_code)
     if not secid:
         return []
+    
     klt_val = int(klt)
-    url = (
-        "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-        f"?secid={urllib.parse.quote(secid)}&klt={klt_val}&fqt=1&lmt={int(limit)}"
-        "&end=20500101&iscca=1&ut=fa5fd1943c7b386f172d6893dbfba10b"
-        "&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
-    )
+    query_params = f"?secid={urllib.parse.quote(secid)}&klt={klt_val}&fqt=1&lmt={int(limit)}&end=20500101&iscca=1&ut=fa5fd1943c7b386f172d6893dbfba10b&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+    
+    # 主接口和备用接口
+    endpoints = [
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get" + query_params,
+        "https://push2.eastmoney.com/api/qt/stock/kline/get" + query_params,
+    ]
+    
     headers = {
         "Referer": "https://quote.eastmoney.com/",
         "User-Agent": SINA_HEADERS.get("User-Agent", "Mozilla/5.0"),
         "Accept": "application/json, text/plain, */*",
     }
-    data = _http_get_json(url, headers=headers, timeout=timeout)
-    result: List[Dict[str, object]] = []
-    try:
-        klines = ((data or {}).get("data") or {}).get("klines") or []
-    except Exception:
-        klines = []
-    for rec in klines:
-        # rec like: "YYYY-MM-DD HH:MM,open,close,high,low,volume,amount,amplitude,chg_pct,chg_amt,turnover"
+    
+    last_exception = None
+    for idx, url in enumerate(endpoints):
         try:
-            parts = str(rec).split(",")
-            if len(parts) < 11:
-                continue
-            result.append({
-                "datetime": parts[0],
-                "open": _safe_float(parts[1]),
-                "close": _safe_float(parts[2]),
-                "high": _safe_float(parts[3]),
-                "low": _safe_float(parts[4]),
-                "volume": _safe_float(parts[5]),
-                "amount": _safe_float(parts[6]),
-                "amplitude_pct": _safe_float(parts[7]),
-                "change_pct": _safe_float(parts[8]),
-                "change_amt": _safe_float(parts[9]),
-                "turnover_pct": _safe_float(parts[10]),
-            })
-        except Exception:
-            continue
-    return result
+            data = _http_get_json(url, headers=headers, timeout=timeout)
+            result: List[Dict[str, object]] = []
+            try:
+                klines = ((data or {}).get("data") or {}).get("klines") or []
+            except Exception:
+                klines = []
+            
+            for rec in klines:
+                # rec like: "YYYY-MM-DD HH:MM,open,close,high,low,volume,amount,amplitude,chg_pct,chg_amt,turnover"
+                try:
+                    parts = str(rec).split(",")
+                    if len(parts) < 11:
+                        continue
+                    result.append({
+                        "datetime": parts[0],
+                        "open": _safe_float(parts[1]),
+                        "close": _safe_float(parts[2]),
+                        "high": _safe_float(parts[3]),
+                        "low": _safe_float(parts[4]),
+                        "volume": _safe_float(parts[5]),
+                        "amount": _safe_float(parts[6]),
+                        "amplitude_pct": _safe_float(parts[7]),
+                        "change_pct": _safe_float(parts[8]),
+                        "change_amt": _safe_float(parts[9]),
+                        "turnover_pct": _safe_float(parts[10]),
+                    })
+                except Exception:
+                    continue
+            
+            if idx > 0:
+                logger.info(f"东方财富分钟线数据使用备用接口成功 endpoint={url}")
+            return result
+        except Exception as e:
+            last_exception = e
+            logger.warning(f"东方财富分钟线数据接口失败 endpoint={url} error={str(e)}")
+            if idx < len(endpoints) - 1:
+                logger.info(f"尝试备用接口 fallback_endpoint={endpoints[idx + 1]}")
+    
+    # 所有接口都失败，返回空列表（避免影响其他功能）
+    logger.error(f"东方财富分钟线数据所有接口都失败 code={full_code} klt={klt_val} error={str(last_exception)}")
+    return []
 
 
 def _simple_moving_average(values: List[float], window: int) -> List[float]:
