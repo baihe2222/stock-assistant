@@ -56,8 +56,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SINA_QUOTE_ENDPOINT = "https://hq.sinajs.cn/list="
-SINA_QUOTE_FALLBACK_ENDPOINT = "https://hq.sina.com.cn/list="  # 备用新浪行情接口
+# 行情接口配置（按亚太地区稳定性排序）
+TENCENT_QUOTE_ENDPOINT = "https://qt.gtimg.cn/q="  # 腾讯财经（亚太地区优先，CDN覆盖好）
+SINA_QUOTE_ENDPOINT = "https://hq.sinajs.cn/list="  # 新浪财经主接口
+SINA_QUOTE_FALLBACK_ENDPOINT = "https://hq.sina.com.cn/list="  # 新浪备用接口
+NETEASE_QUOTE_ENDPOINT = "https://api.money.126.net/data/feed/"  # 网易财经备用
+
 SINA_HEADERS = {
     # Referer 头有助于避免部分防盗链策略
     "Referer": "https://finance.sina.com.cn/",
@@ -66,6 +70,22 @@ SINA_HEADERS = {
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept-Charset": "GBK,utf-8;q=0.7,*;q=0.3",
+}
+
+TENCENT_HEADERS = {
+    "Referer": "https://finance.qq.com/",
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+}
+
+NETEASE_HEADERS = {
+    "Referer": "https://money.163.com/",
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
 }
 
 SINA_SUGGEST_ENDPOINT = "https://suggest3.sinajs.cn/suggest"
@@ -497,6 +517,159 @@ def _safe_int(value: str) -> int:
         return 0
 
 
+def parse_tencent_line(line: str) -> Optional[Dict[str, object]]:
+    """Parse one line of Tencent quote response.
+    
+    Example line (A股):
+    v_sh600000="51~浦发银行~600000~10.92~10.85~10.93~104808~48493~56315~10.92~85~10.91~114~...";
+    
+    Example line (港股):
+    v_hk00700="1~腾讯控股~00700~420.00~415.00~420.20~50000~25000~..."
+    """
+    if not line or "v_" not in line:
+        return None
+    
+    try:
+        head, payload = line.split("=", 1)
+    except ValueError:
+        return None
+    
+    # Extract code like sh600000 or hk00700
+    code_pos = head.rfind("v_")
+    if code_pos == -1:
+        return None
+    var_name = head[code_pos + len("v_"):].strip()
+    var_name = var_name.replace(" ", "")
+    
+    # payload is like "...";
+    if not payload.strip().startswith("\""):
+        return None
+    content = payload.strip().strip("\r\n").strip(";")
+    if content.startswith("\"") and content.endswith("\""):
+        content = content[1:-1]
+    
+    fields = content.split("~") if content else []
+    if len(fields) < 5:
+        return None
+    
+    exchange = var_name[:2] if len(var_name) >= 2 else ""
+    code_digits = var_name[2:]
+    
+    # 腾讯接口格式（A股约53个字段，港股格式略有不同）
+    # A股字段：0=未知 1=名称 2=代码 3=当前价 4=昨收 5=今开 6=成交量(手) 7=外盘 8=内盘 
+    # 9=买一量 10=买一价 11=买二量 12=买二价... 19=卖一量 20=卖一价...
+    # 30=日期 31=时间 32=涨跌额 33=涨跌幅 34=最高 35=最低 36=成交价/成交量/成交额...
+    
+    try:
+        name_cn = fields[1] if len(fields) > 1 else ""
+        current_price = _safe_float(fields[3]) if len(fields) > 3 else 0.0
+        prev_close = _safe_float(fields[4]) if len(fields) > 4 else 0.0
+        today_open = _safe_float(fields[5]) if len(fields) > 5 else 0.0
+        
+        # A股/港股通用字段
+        if exchange in {"sh", "sz", "bj"}:
+            # A股格式
+            volume_hands = _safe_int(fields[6]) if len(fields) > 6 else 0
+            volume_shares = volume_hands * 100
+            
+            # 买卖盘
+            buy_levels: List[Tuple[float, float]] = []
+            sell_levels: List[Tuple[float, float]] = []
+            
+            # 买一到买五：(9,10), (11,12), (13,14), (15,16), (17,18)
+            for i in range(5):
+                vol_idx = 9 + i * 2
+                price_idx = 10 + i * 2
+                if len(fields) > price_idx:
+                    buy_levels.append((_safe_int(fields[vol_idx]), _safe_float(fields[price_idx])))
+            
+            # 卖一到卖五：(19,20), (21,22), (23,24), (25,26), (27,28)
+            for i in range(5):
+                vol_idx = 19 + i * 2
+                price_idx = 20 + i * 2
+                if len(fields) > price_idx:
+                    sell_levels.append((_safe_int(fields[vol_idx]), _safe_float(fields[price_idx])))
+            
+            high_price = _safe_float(fields[33]) if len(fields) > 33 else 0.0
+            low_price = _safe_float(fields[34]) if len(fields) > 34 else 0.0
+            amount_yuan = _safe_float(fields[37]) * 10000.0 if len(fields) > 37 else 0.0  # 单位：万元
+            
+            # 腾讯接口字段30是合并的日期时间（格式：yyyyMMddHHmmss）
+            raw_datetime = fields[30] if len(fields) > 30 else ""
+            # 格式化为标准格式：2025-10-31 10:22:52
+            if raw_datetime and len(raw_datetime) >= 14:
+                trade_date = f"{raw_datetime[0:4]}-{raw_datetime[4:6]}-{raw_datetime[6:8]}"
+                trade_time = f"{raw_datetime[8:10]}:{raw_datetime[10:12]}:{raw_datetime[12:14]}"
+            else:
+                trade_date = raw_datetime
+                trade_time = ""
+            
+            bid_price = buy_levels[0][1] if buy_levels else 0.0
+            ask_price = sell_levels[0][1] if sell_levels else 0.0
+            
+            return {
+                "exchange": exchange,
+                "code": code_digits,
+                "name": name_cn,
+                "current": current_price,
+                "prev_close": prev_close,
+                "open": today_open,
+                "high": high_price,
+                "low": low_price,
+                "bid": bid_price,
+                "ask": ask_price,
+                "volume_shares": volume_shares,
+                "amount_yuan": amount_yuan,
+                "buys": buy_levels,
+                "sells": sell_levels,
+                "date": trade_date,
+                "time": trade_time,
+            }
+        
+        elif exchange == "hk":
+            # 港股格式（字段较少）
+            volume_shares = _safe_int(fields[6]) if len(fields) > 6 else 0
+            high_price = _safe_float(fields[33]) if len(fields) > 33 else current_price
+            low_price = _safe_float(fields[34]) if len(fields) > 34 else current_price
+            amount_hkd = _safe_float(fields[37]) * 10000.0 if len(fields) > 37 else 0.0
+            
+            # 港股字段30是日期时间（格式：yyyy/MM/dd HH:mm:ss）
+            raw_datetime = fields[30] if len(fields) > 30 else ""
+            if " " in raw_datetime:
+                parts = raw_datetime.split(" ", 1)
+                trade_date = parts[0]
+                trade_time = parts[1] if len(parts) > 1 else ""
+            else:
+                trade_date = raw_datetime
+                trade_time = ""
+            
+            bid_price = _safe_float(fields[10]) if len(fields) > 10 else 0.0
+            ask_price = _safe_float(fields[20]) if len(fields) > 20 else 0.0
+            
+            return {
+                "exchange": exchange,
+                "code": code_digits,
+                "name": name_cn,
+                "current": current_price,
+                "prev_close": prev_close,
+                "open": today_open,
+                "high": high_price,
+                "low": low_price,
+                "bid": bid_price,
+                "ask": ask_price,
+                "volume_shares": volume_shares,
+                "amount_yuan": amount_hkd,
+                "buys": [],
+                "sells": [],
+                "date": trade_date,
+                "time": trade_time,
+            }
+    except Exception:
+        return None
+    
+    return None
+
+
 def parse_sina_line(line: str) -> Optional[Dict[str, object]]:
     """Parse one line of Sina quote response.
 
@@ -624,46 +797,82 @@ def parse_sina_line(line: str) -> Optional[Dict[str, object]]:
     }
 
 
-def fetch_sina_quotes(prefixed_codes: List[str], timeout: float = 5.0) -> Dict[str, Dict[str, object]]:
-    """Fetch quotes for a list of prefixed codes from Sina.
-
+def fetch_sina_quotes(prefixed_codes: List[str], timeout: float = 8.0) -> Dict[str, Dict[str, object]]:
+    """Fetch quotes from multiple sources with fallback support.
+    
+    按亚太地区稳定性优先级顺序尝试：
+    1. 腾讯财经 (qt.gtimg.cn) - 亚太地区CDN覆盖最好
+    2. 新浪财经 (hq.sinajs.cn) - 主接口
+    3. 新浪备用 (hq.sina.com.cn)
+    
     Returns a dict keyed by full code like "sh600519".
-    \u5c1d\u8bd5\u4e3b\u63a5\u53e3\uff0c\u5931\u8d25\u540e\u5c1d\u8bd5\u5907\u7528\u63a5\u53e3\u3002
     """
     if not prefixed_codes:
         return {}
 
     codes_str = ",".join(prefixed_codes)
+    
+    # 按亚太地区网络稳定性排序的接口列表
     endpoints = [
-        SINA_QUOTE_ENDPOINT + codes_str,
-        SINA_QUOTE_FALLBACK_ENDPOINT + codes_str,
+        {
+            "name": "腾讯财经",
+            "url": TENCENT_QUOTE_ENDPOINT + codes_str,
+            "headers": TENCENT_HEADERS,
+            "parser": parse_tencent_line,
+            "timeout": timeout * 0.7,  # 腾讯接口更快，较短超时
+            "max_retries": 2,
+        },
+        {
+            "name": "新浪主接口",
+            "url": SINA_QUOTE_ENDPOINT + codes_str,
+            "headers": SINA_HEADERS,
+            "parser": parse_sina_line,
+            "timeout": timeout,
+            "max_retries": 2,
+        },
+        {
+            "name": "新浪备用接口",
+            "url": SINA_QUOTE_FALLBACK_ENDPOINT + codes_str,
+            "headers": SINA_HEADERS,
+            "parser": parse_sina_line,
+            "timeout": timeout,
+            "max_retries": 2,
+        },
     ]
     
     last_exception = None
-    for idx, url in enumerate(endpoints):
+    for idx, endpoint_config in enumerate(endpoints):
         try:
-            text = http_get_text(url, headers=SINA_HEADERS, timeout=timeout, max_retries=3)
+            text = http_get_text(
+                endpoint_config["url"],
+                headers=endpoint_config["headers"],
+                timeout=endpoint_config["timeout"],
+                max_retries=endpoint_config["max_retries"]
+            )
             result: Dict[str, Dict[str, object]] = {}
             for line in text.splitlines():
-                parsed = parse_sina_line(line)
+                parsed = endpoint_config["parser"](line)
                 if not parsed:
                     continue
                 full_code = f"{parsed['exchange']}{parsed['code']}"
                 result[full_code] = parsed
             
-            if idx > 0:
-                logger.info(f"使用备用接口成功 endpoint={url}")
-            return result
+            if result:  # 确保解析到了数据
+                if idx > 0:
+                    logger.info(f"使用备用接口成功 source={endpoint_config['name']} url={endpoint_config['url']}")
+                return result
         except Exception as e:
             last_exception = e
-            logger.warning(f"接口请求失败 endpoint={url} error={str(e)}")
+            logger.warning(f"接口请求失败 source={endpoint_config['name']} error={str(e)}")
             if idx < len(endpoints) - 1:
-                logger.info(f"尝试备用接口 fallback_endpoint={endpoints[idx + 1]}")
+                logger.info(f"尝试下一个接口 next_source={endpoints[idx + 1]['name']}")
     
     # 所有接口都失败，抛出异常
     if last_exception:
         raise last_exception
     return {}
+
+
 
 
 def compute_order_metrics(quote: Dict[str, object]) -> Tuple[float, float]:
@@ -1106,7 +1315,8 @@ def query_and_display(codes_or_names: List[str], show_detail: bool = False) -> N
         return
 
     try:
-        quotes = fetch_sina_quotes(normalized, timeout=5.0)
+        # 针对海外网络环境（香港/印尼）延长超时时间至8秒
+        quotes = fetch_sina_quotes(normalized, timeout=8.0)
     except Exception as exc:
         print(f"请求行情失败：{exc}")
         return
